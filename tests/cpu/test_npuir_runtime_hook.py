@@ -253,6 +253,30 @@ class TestEnableInstallation(_EnvSandbox):
         _reset_for_tests()
         self.assertNotIsInstance(ascend_compiler.subprocess, _SubprocessProxy)
 
+    def test_refactored_backend_is_reported_not_silently_ignored(self):
+        """A renamed entry point must warn, not produce a pass-less trace."""
+        import types
+
+        from tritonparse.ascend_npuir import _reset_for_tests
+
+        _reset_for_tests()
+        import triton.backends.ascend as ascend_pkg
+
+        fake = types.ModuleType("triton.backends.ascend.compiler")
+        fake.subprocess = subprocess
+        # Deliberately no linalg_to_bin_enable_npu_compile_* functions.
+        # Patch the attribute on the parent package too: `from X import Y` prefers
+        # getattr(X, "Y") over sys.modules["X.Y"].
+        with (
+            patch.object(ascend_pkg, "compiler", fake),
+            self.assertLogs("tritonparse", level="WARNING") as captured,
+        ):
+            self.assertFalse(enable_npuir_pass_dump())
+        self.assertTrue(
+            any("could not be installed" in line for line in captured.output),
+            captured.output,
+        )
+
     def test_install_wraps_both_compile_entry_points(self):
         if not enable_npuir_pass_dump():
             self.skipTest("Ascend backend not importable in this environment")

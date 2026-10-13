@@ -222,6 +222,30 @@ def enable_npuir_pass_dump() -> bool:
             )
             return False
 
+        # The hook relies on the compile entry points and on the module-level
+        # `subprocess` name. Both have been stable across every triton-ascend
+        # version checked (release and daily, standalone and as vendored by
+        # Triton-distributed-ascend), but a future refactor would otherwise fail
+        # silently -- the trace would simply contain no passes. Warn loudly
+        # instead of pretending the feature is on.
+        missing = [
+            name
+            for name in (
+                "linalg_to_bin_enable_npu_compile_910_95",
+                "linalg_to_bin_enable_npu_compile_A2_A3",
+            )
+            if not callable(getattr(ascend_compiler, name, None))
+        ]
+        if missing or not hasattr(ascend_compiler, "subprocess"):
+            logger.warning(
+                "Ascend NPUIR pass dump could not be installed: %s is missing %s. "
+                "The compilation pipeline may have been refactored; NPUIR passes "
+                "will not be captured.",
+                getattr(ascend_compiler, "__file__", "triton.backends.ascend.compiler"),
+                ", ".join(missing) or "the module-level `subprocess` name",
+            )
+            return False
+
         # Only bishengir calls are touched, and only via the module-level name in
         # the Ascend compiler -- the global subprocess module is left alone.
         if not isinstance(
