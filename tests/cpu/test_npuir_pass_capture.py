@@ -540,3 +540,69 @@ class TestAscendAdapterStageOrdering(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestExampleReporting(unittest.TestCase):
+    """Guards the on-device example's trace summary against bit-rot.
+
+    The example itself needs an NPU, but its reporting half is plain code over a
+    parsed trace, so it can be checked here against the same fixture the rest of
+    this module uses.
+    """
+
+    @staticmethod
+    def _load_example():
+        # Importing must not touch torch/npu; only main() does.
+        from tritonparse.tools import ascend_npuir_capture
+
+        return ascend_npuir_capture
+
+    def test_example_is_importable_without_a_device(self):
+        self.assertTrue(hasattr(self._load_example(), "report_stages"))
+
+    def test_report_stages_summarises_a_parsed_trace(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+
+        example = self._load_example()
+        parsed = json.loads(parse_single_trace_content(json.dumps(_build_entry())))
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "trace.ndjson"
+            out.write_text(json.dumps(parsed) + "\n")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                example.report_stages(tmp, None)
+        text = buf.getvalue()
+
+        self.assertIn("NPUIR passes    : ", text)
+        self.assertIn("source mappings :", text)
+        # It must surface the sync passes, which are the reason to use this.
+        self.assertIn("hivm_graph_sync_solver", text)
+        self.assertIn("first passes (in execution order)", text)
+
+    def test_report_stages_explains_an_empty_capture(self):
+        """A trace with no passes must say why, not just print a zero."""
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+
+        example = self._load_example()
+        entry = _build_entry()
+        entry["payload"]["file_content"].pop(RAW_LOG_FILENAME)
+        entry["payload"]["file_path"] = {}
+        parsed = json.loads(parse_single_trace_content(json.dumps(entry)))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "trace.ndjson").write_text(json.dumps(parsed) + "\n")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                example.report_stages(tmp, None)
+        self.assertIn("No NPUIR pass stages", buf.getvalue())
+
+    def test_report_stages_fails_loudly_without_a_trace(self):
+        import tempfile
+
+        example = self._load_example()
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(SystemExit):
+            example.report_stages(tmp, None)

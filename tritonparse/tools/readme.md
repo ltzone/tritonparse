@@ -35,3 +35,34 @@ python extract_irs.py -i logs.ndjson --line 0 -o ./irs --kernel-name my_kernel
 - `*.ptx` - PTX assembly
 - `*.json` - Kernel metadata
 - `*_source.py` - Python source code (if available)
+
+### ascend_npuir_capture.py
+Run a Triton kernel on a real Ascend NPU and capture every bishengir NPUIR
+compiler pass into a TritonParse trace. Self-diagnosing: `--check` reports which
+of the required pieces (NPU, `torch_npu`, `bishengir-compile`, a triton with
+`knobs`) is missing.
+
+**Usage:**
+```bash
+python -m tritonparse.tools.ascend_npuir_capture --check
+python -m tritonparse.tools.ascend_npuir_capture --out ./npuir_demo
+python -m tritonparse.tools.ascend_npuir_capture --filter hivm-graph-sync-solver,hivm-inject-sync
+```
+
+**Arguments:**
+- `--out`: Output directory (default `./npuir_demo`)
+- `--filter`: Comma-separated pass arguments to capture (default: all)
+- `--size`, `--block-size`: Workload shape
+- `--check`: Only verify the environment, then exit
+
+See [docs/11.-Ascend-NPUIR-Pass-Capture.md](../docs/11.-Ascend-NPUIR-Pass-Capture.md).
+
+### demo_npuir_pass_capture.py
+Same feature, but with the NPU faked so it runs on any machine (it drives a real
+`bishengir-compile` and the real parse pipeline).
+
+**Usage:**
+```bash
+export PATH=/path/to/bishengir/bin:$PATH
+python -m tritonparse.tools.demo_npuir_pass_capture --out /tmp/npuir_demo
+```
