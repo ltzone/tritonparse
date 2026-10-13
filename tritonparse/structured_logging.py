@@ -1184,6 +1184,81 @@ def _extract_file_content_legacy(
             )
 
 
+def _npuir_pass_dump_enabled() -> bool:
+    """Whether the Ascend NPUIR pass dump feature is switched on."""
+    return os.getenv("TRITONPARSE_ENABLE_NPUIR_PASS_DUMP", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _resolve_npuir_pass_log_path(metadata: Dict[str, Any]) -> Optional[str]:
+    """Locate the ``npuir_passes.log`` produced by triton-ascend's compiler.
+
+    triton-ascend records the absolute path in ``metadata["npuir_passes_log_path"]``
+    right after the subprocess finishes. When that key is absent (older
+    triton-ascend, or a cache hit on a trace written before the key existed) we
+    fall back to triton's dump directory for this kernel hash, which is where
+    ``_save_npuir_pass_dump`` stores the file.
+    """
+    recorded = metadata.get("npuir_passes_log_path")
+    if recorded and os.path.exists(recorded):
+        return recorded
+
+    kernel_hash = metadata.get("hash")
+    if not kernel_hash:
+        return None
+    try:
+        from triton.runtime.cache import get_dump_manager
+
+        dump_dir = get_dump_manager(kernel_hash).cache_dir
+    except Exception as e:  # pragma: no cover - depends on triton internals
+        log.debug("Could not resolve triton dump dir for NPUIR passes: %s", e)
+        return None
+    candidate = os.path.join(dump_dir, "npuir_passes.log")
+    return candidate if os.path.exists(candidate) else None
+
+
+def _attach_npuir_pass_log(
+    trace_data: Dict[str, Any], metadata: Dict[str, Any]
+) -> None:
+    """Embed the raw bishengir NPUIR pass dump into the compilation trace.
+
+    The dump is the combined stdout+stderr of ``bishengir-compile
+    --mlir-print-ir-after-all``. It is stored under ``kernel.npuir_passes.log``
+    so the parse step can split it into per-pass artifacts without needing
+    access to the machine that produced the trace.
+
+    The producer is either a patched triton-ascend or -- on a stock one --
+    ``tritonparse.ascend_npuir``; both record ``npuir_passes_log_path`` in the
+    compilation metadata, so this function does not care which ran.
+    """
+    recorded = metadata.get("npuir_passes_log_path")
+    if recorded:
+        log_path = recorded if os.path.exists(recorded) else None
+    elif _npuir_pass_dump_enabled():
+        log_path = _resolve_npuir_pass_log_path(metadata)
+    else:
+        return
+
+    if not log_path:
+        return
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError as e:
+        log.warning("Could not read NPUIR pass dump %s: %s", log_path, e)
+        return
+    if not content:
+        return
+
+    filename = "kernel.npuir_passes.log"
+    trace_data["file_content"][filename] = content
+    trace_data["file_path"][filename] = log_path
+
+
 def extract_metadata_from_src(trace_data, src):
     from triton._C.libtriton import get_cache_invalidating_env_vars
 
@@ -1633,6 +1708,10 @@ def maybe_trace_triton(
     # Pass backend_name for adapter-driven file extraction
     backend_name = trace_data["metadata"].get("backend_name", "")
     extract_file_content(trace_data, metadata_group, backend_name)
+    # Ascend only: embed the bishengir NPUIR pass dump captured by
+    # triton-ascend's compiler.py so the parse step can split it into one
+    # artifact per pass.
+    _attach_npuir_pass_log(trace_data, metadata)
     # Extract Python source code information if available
     extract_python_source_info(trace_data, src)
     extract_metadata_from_src(trace_data, src)
@@ -2166,6 +2245,12 @@ def init_basic(trace_folder: Optional[str] = None):
 
     init_logs()
     maybe_enable_trace_launch()
+    # Ascend only, and only when opted in: install the NPUIR pass-dump hooks into
+    # the stock Ascend backend so no patched triton-ascend is needed. A no-op on
+    # every other backend and when the environment variable is unset.
+    from tritonparse.ascend_npuir import maybe_enable_from_env
+
+    maybe_enable_from_env()
 
 
 def init(

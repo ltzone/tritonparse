@@ -8,7 +8,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from tritonparse._json_compat import dumps, JSONDecodeError, loads
-from tritonparse.backend import AnalyzerContext
+from tritonparse.backend import (
+    AnalyzerContext,
+    humanize_bishengir_pass,
+    make_npuir_pass_stage_descriptor,
+    NPUIR_PASS_DISPLAY_ORDER_BASE,
+    NPUIR_PASS_STAGE_PREFIX,
+    sanitize_npuir_pass_name,
+)
 from tritonparse.kernel_filter import KernelPatterns
 from tritonparse.tools.compression import open_compressed_file
 from tritonparse.tp_logger import get_logger
@@ -268,8 +275,182 @@ def generate_source_mappings(
     return _parse_generic_loc(ir_content, other_mappings, ir_type)
 
 
+# =============================================================================
+# BISHENGIR NPUIR PASS DUMP SPLITTING
+# =============================================================================
+#
+# ``bishengir-compile --mlir-print-ir-after-all`` prints one MLIR module per
+# pass to stderr, each introduced by a header of the form::
+#
+#     // -----// IR Dump After ConvertLinalgToHFusion (convert-linalg-to-hfusion) //----- //
+#
+# The subprocess stream is captured verbatim by triton-ascend's ``compiler.py``
+# into ``kernel.npuir_passes.log`` and embedded in the trace by
+# ``structured_logging``. This module splits that stream into per-pass artifacts
+# and registers a stage for each.
+
+_BISHENGIR_DUMP_HEADER_RE = re.compile(
+    r"^//\s*-----//\s*IR Dump After (?P<name>.+?) \((?P<arg>[^()]+)\)"
+)
+
+# bishengir interleaves its own diagnostics with the IR dumps (e.g.
+# ``[WARNING] Failed to detect hivmc version``). Those lines land inside the
+# buffer of whichever pass was dumped last, so they are dropped rather than
+# attributed to that pass's IR. MLIR text never starts a line with a
+# bracketed log level, so this cannot remove real IR.
+_BISHENGIR_LOG_LINE_RE = re.compile(r"^\[(?:ERROR|WARNING|INFO|DEBUG|FATAL)\]")
+
+# The raw combined stream is only an intermediate; it is replaced by the split
+# per-pass artifacts so it never shows up as a selectable stage in the UI.
+NPUIR_PASS_LOG_FILENAMES = ("kernel.npuir_passes.log", "npuir_passes.log")
+
+
+def _split_bishengir_dump_log(log_text: str) -> List[Tuple[str, str, str]]:
+    """Split a bishengir IR-dump stream into ``(mlir_name, pass_arg, ir)`` records.
+
+    Content before the first header (compiler warnings/errors) is ignored, as is
+    any trailing non-dump output after the last module.
+
+    Args:
+        log_text: Combined stdout+stderr of ``bishengir-compile``.
+
+    Returns:
+        One tuple per pass, in execution order. ``mlir_name`` is the MLIR pass
+        class name (e.g. ``ConvertLinalgToHFusion``) and ``pass_arg`` the
+        command-line argument (e.g. ``convert-linalg-to-hfusion``).
+    """
+    if not log_text:
+        return []
+
+    records: List[Tuple[str, str, str]] = []
+    mlir_name: Optional[str] = None
+    pass_arg: Optional[str] = None
+    buf: List[str] = []
+
+    for line in log_text.splitlines(keepends=True):
+        match = _BISHENGIR_DUMP_HEADER_RE.match(line)
+        if match:
+            if mlir_name is not None and buf:
+                records.append((mlir_name, pass_arg or "", "".join(buf)))
+            mlir_name = match.group("name").strip()
+            pass_arg = match.group("arg").strip()
+            buf = []
+        elif mlir_name is not None:
+            if not _BISHENGIR_LOG_LINE_RE.match(line):
+                buf.append(line)
+
+    if mlir_name is not None and buf:
+        records.append((mlir_name, pass_arg or "", "".join(buf)))
+
+    return records
+
+
+def _load_npuir_pass_log(payload: Dict[str, Any]) -> Optional[str]:
+    """Locate the raw NPUIR pass dump for a compilation event.
+
+    Prefers the content embedded in ``file_content`` (portable traces), then a
+    path in ``file_path``, then the explicit path recorded by triton-ascend in
+    the trace metadata. Returns ``None`` when no dump is available.
+    """
+    file_content = payload.get("file_content") or {}
+    for name in NPUIR_PASS_LOG_FILENAMES:
+        content = file_content.get(name)
+        if content:
+            return content
+
+    file_path = payload.get("file_path") or {}
+    metadata = payload.get("metadata") or {}
+    candidates = [file_path.get(name) for name in NPUIR_PASS_LOG_FILENAMES]
+    candidates.append(metadata.get("npuir_passes_log_path"))
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            try:
+                with open(candidate, "r", encoding="utf-8", errors="replace") as f:
+                    return f.read()
+            except OSError as e:
+                logger.warning(f"Could not read NPUIR pass dump {candidate}: {e}")
+    return None
+
+
+def _get_npuir_pass_filter() -> Optional[Set[str]]:
+    """Parse ``TRITONPARSE_NPUIR_PASS_FILTER`` into a set of pass arguments."""
+    raw = os.getenv("TRITONPARSE_NPUIR_PASS_FILTER", "").strip()
+    if not raw:
+        return None
+    names = {part.strip() for part in raw.split(",") if part.strip()}
+    return names or None
+
+
+def _inject_npuir_pass_irs(payload: Dict[str, Any]) -> List[Any]:
+    """Split the NPUIR pass dump into per-pass artifacts and build stage descriptors.
+
+    Each pass becomes ``file_content["kernel.<stage_name>"]`` where
+    ``stage_name`` is ``npuir_pass_<sanitized-arg>`` (``_N`` suffixed for repeat
+    runs). The raw combined log is removed from ``file_content`` afterwards.
+
+    Returns:
+        The list of dynamically-built :class:`IRStageDescriptor` objects, in
+        execution order. Empty when the trace carries no NPUIR dump.
+    """
+    log_text = _load_npuir_pass_log(payload)
+    if not log_text:
+        return []
+
+    records = _split_bishengir_dump_log(log_text)
+    if not records:
+        return []
+
+    enabled = _get_npuir_pass_filter()
+    file_content = payload.setdefault("file_content", {})
+
+    seen: Dict[str, int] = {}
+    stages: List[Any] = []
+    summary: List[Dict[str, Any]] = []
+    order = NPUIR_PASS_DISPLAY_ORDER_BASE
+
+    for mlir_name, pass_arg, ir in records:
+        if enabled is not None and pass_arg not in enabled:
+            continue
+
+        seen[pass_arg] = seen.get(pass_arg, 0) + 1
+        occurrence = seen[pass_arg]
+        suffix = f"_{occurrence}" if occurrence > 1 else ""
+        stage_name = (
+            f"{NPUIR_PASS_STAGE_PREFIX}{sanitize_npuir_pass_name(pass_arg)}{suffix}"
+        )
+        display_label = humanize_bishengir_pass(pass_arg, mlir_name)
+
+        order += 1
+        file_content[f"kernel.{stage_name}"] = ir
+        stages.append(
+            make_npuir_pass_stage_descriptor(stage_name, display_label, order)
+        )
+        summary.append(
+            {
+                "stage": stage_name,
+                "pass_arg": pass_arg,
+                "mlir_pass": mlir_name,
+                "display_name": display_label,
+                "display_order": order,
+                "occurrence": occurrence,
+            }
+        )
+
+    # The raw stream is an implementation detail; drop it so it is not offered
+    # as a selectable artifact. The file_path entry (if any) is kept for
+    # provenance.
+    for name in NPUIR_PASS_LOG_FILENAMES:
+        file_content.pop(name, None)
+
+    if summary:
+        payload["npuir_passes"] = summary
+
+    return stages
+
+
 def _resolve_source_mappable_stage_keys(
     entry: Dict[str, Any],
+    extra_stages: Optional[List[Any]] = None,
 ) -> Dict[str, str]:
     """
     Resolve stage keys in a trace that support source mapping.
@@ -288,6 +469,9 @@ def _resolve_source_mappable_stage_keys(
 
     Args:
         entry: Trace event dict containing event_type and payload.
+        extra_stages: Additional per-trace :class:`IRStageDescriptor` objects
+            (e.g. dynamically discovered NPUIR pass stages) to consider in
+            addition to the adapter's static stage list.
 
     Returns:
         Dict mapping stage name to artifact filename
@@ -305,7 +489,10 @@ def _resolve_source_mappable_stage_keys(
         from tritonparse.backend import get_backend_registry
 
         adapter = get_backend_registry().resolve_from_trace(metadata)
-        for stage in adapter.list_ir_stages():
+        stages = list(adapter.list_ir_stages())
+        if extra_stages:
+            stages.extend(extra_stages)
+        for stage in stages:
             if not stage.supports_source_mapping:
                 continue
             artifact_name = next(
@@ -514,17 +701,29 @@ def parse_single_trace_content(trace_content: str) -> str:
         file_path = payload.get("file_path", {})
         metadata = payload.setdefault("metadata", {})
 
-        # Use the new stage resolution helper instead of hardcoded stage lookup.
-        # Returns: {"ttir": "kernel.ttir", "ttgir": "kernel.ttgir", ...}
-        stage_keys = _resolve_source_mappable_stage_keys(entry)
-
-        # Add ir_stages descriptor to payload for frontend consumption.
-        # Placed before the early return so compilations without IR files
-        # still carry stage metadata.
+        # Resolve the backend adapter once and use it for both the NPUIR pass
+        # stages and the static stage descriptors.
+        adapter = None
         try:
             from tritonparse.backend import get_backend_registry
 
             adapter = get_backend_registry().resolve_from_trace(metadata)
+        except ValueError:
+            logger.warning("Could not resolve adapter for ir_stages; skipping")
+
+        # Split any bishengir NPUIR pass dump into one artifact per pass. This
+        # must run before stage resolution so the new artifacts are visible.
+        extra_stages = _inject_npuir_pass_irs(payload)
+
+        # Use the new stage resolution helper instead of hardcoded stage lookup.
+        # Returns: {"ttir": "kernel.ttir", "ttgir": "kernel.ttgir", ...}
+        stage_keys = _resolve_source_mappable_stage_keys(entry, extra_stages)
+
+        # Add ir_stages descriptor to payload for frontend consumption.
+        # Placed before the early return so compilations without IR files
+        # still carry stage metadata.
+        if adapter is not None:
+            all_stages = list(adapter.list_ir_stages()) + extra_stages
             payload["ir_stages"] = [
                 {
                     "name": stage.name,
@@ -534,11 +733,10 @@ def parse_single_trace_content(trace_content: str) -> str:
                     "is_text": stage.is_text,
                     "supports_source_mapping": stage.supports_source_mapping,
                     "syntax_id": stage.syntax_id,
+                    "is_pass_level": stage.is_pass_level,
                 }
-                for stage in adapter.list_ir_stages()
+                for stage in all_stages
             ]
-        except ValueError:
-            logger.warning("Could not resolve adapter for ir_stages; skipping")
 
         # Extract original num_warps from TTGIR for warp-specialized kernels.
         # If upstream Triton already set num_warps_base, trust it; otherwise
@@ -589,11 +787,20 @@ def parse_single_trace_content(trace_content: str) -> str:
             if stage_map:
                 stage_maps[stage_name] = stage_map
 
-        # Create bidirectional mappings between every pair of populated stages,
-        # for example TTIR ↔ TTGIR, TTIR ↔ PTX, TTGIR ↔ PTX, ...
+        # Create bidirectional mappings between pairs of populated stages, for
+        # example TTIR <-> TTGIR, TTIR <-> PTX, TTGIR <-> PTX, ...
+        #
+        # NPUIR pass stages are deliberately excluded: a bishengir run emits
+        # 100+ passes, and every pairwise combination would be O(N^2) mappings
+        # over the whole module (billions of line comparisons for a real
+        # kernel). Each pass still gets its own source mapping below, which is
+        # what the Python-source highlight and per-line tooltip need.
         stage_names = list(stage_maps.keys())
-        for i, src_stage in enumerate(stage_names):
-            for tgt_stage in stage_names[i + 1 :]:
+        pairwise_stages = [
+            name for name in stage_names if not name.startswith(NPUIR_PASS_STAGE_PREFIX)
+        ]
+        for i, src_stage in enumerate(pairwise_stages):
+            for tgt_stage in pairwise_stages[i + 1 :]:
                 if stage_maps[src_stage] and stage_maps[tgt_stage]:
                     create_bidirectional_mapping(
                         stage_maps[src_stage],

@@ -233,6 +233,10 @@
         "syntax_id": {
           "type": "string",
           "description": "Identifier for the syntax highlighting mode to use."
+        },
+        "is_pass_level": {
+          "type": "boolean",
+          "description": "True for compiler-pass-level stages that exist per trace rather than as a fixed pipeline step (e.g. Ascend NPUIR passes). Shown in the UI but excluded from grouping-anchor and default-panel heuristics. Absent on traces written before this field existed."
         }
       }
     },

@@ -1,6 +1,7 @@
 #  Copyright (c) Meta Platforms, Inc. and affiliates.
 from __future__ import annotations
 
+import re
 from abc import ABC
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -42,6 +43,11 @@ class IRStageDescriptor:
         supports_source_mapping: True if this stage supports source-to-source mapping.
         parser_id: Identifier for the parser to use.
         syntax_id: Syntax highlighting identifier for web display.
+        is_pass_level: True for compiler-pass-level stages that exist per trace
+            rather than as a fixed pipeline step (e.g. Ascend NPUIR passes).
+            The frontend shows them alongside the main stages but excludes them
+            from "middle of the pipeline" grouping anchors, where the bulk of
+            pass stages would otherwise displace the real anchor.
     """
 
     name: str
@@ -52,6 +58,132 @@ class IRStageDescriptor:
     supports_source_mapping: bool
     parser_id: str
     syntax_id: str
+    is_pass_level: bool = False
+
+
+# =============================================================================
+# BISHENGIR NPUIR PASS SUPPORT (ASCEND)
+# =============================================================================
+#
+# Bishengir runs its NPUIR transformation passes inside the ``bishengir-compile``
+# subprocess (TTAdapter -> NPUBIN). With ``--mlir-print-ir-after-all`` the
+# subprocess emits one MLIR dump per pass, each preceded by a header such as::
+#
+#     // -----// IR Dump After ConvertLinalgToHFusion (convert-linalg-to-hfusion) //----- //
+#
+# TritonParse splits that stream into one artifact per pass and registers a
+# stage for each. Stage names are ``npuir_pass_<sanitized-arg>`` (with a ``_N``
+# suffix for repeated runs of the same pass). The artifact filename is
+# ``kernel.<stage_name>`` -- deliberately *without* a trailing ``.mlir``.
+#
+# The no-``.mlir`` convention is what keeps the frontend data-driven: the UI
+# recovers a stage name from a filename with ``filename.split(".").pop()`` and
+# reads ``source_mappings[<that name>]``. A ``.mlir`` suffix would collapse every
+# pass artifact to the name ``mlir`` and silently drop source mappings and MLIR
+# syntax highlighting. ``.ttadapter`` / ``.bcmlir`` follow the same convention.
+
+NPUIR_PASS_STAGE_PREFIX = "npuir_pass_"
+# NPUIR passes are ordered after the Python-side stages (TTIR=10, TTAdapter=20,
+# MLIRBC=30, BCMLIR=40) and before NPUBIN. Values are ints, so the range is not
+# limited to the design's notional 401-499; real bishengir versions emit >130
+# distinct passes.
+NPUIR_PASS_DISPLAY_ORDER_BASE = 400
+
+# Curated display labels for well-known bishengir NPUIR passes, keyed by the
+# pass argument (the token inside parentheses in the dump header). Unlisted
+# passes fall back to a CamelCase split of the MLIR pass name, so the table only
+# needs the passes whose spellings are ambiguous or worth curating.
+BISHENGIR_PASS_LABELS: dict[str, str] = {
+    "canonicalize-module": "Canonicalize Module",
+    "hacc-append-device-spec": "Append Target Device Spec",
+    "hfusion-uplift-while-to-for": "Uplift While to For",
+    "convert-linalg-to-hfusion": "Convert Linalg to HFusion",
+    "convert-arith-to-hfusion": "Convert Arith to HFusion",
+    "convert-math-to-hfusion": "Convert Math to HFusion",
+    "convert-gpu-to-hfusion": "Convert GPU to HFusion",
+    "convert-tensor-to-hfusion": "Convert Tensor to HFusion",
+    "adapt-triton-kernel": "Adapt Triton Kernel",
+    "convert-tensor-to-hivm": "Convert Tensor to HIVM",
+    "convert-to-hivm-op": "Convert to HIVM Op",
+    "convert-hfusion-to-hivm": "Convert HFusion to HIVM",
+    "hivm-plan-memory": "HIVM Plan Memory",
+    "hivm-decompose-op": "HIVM Decompose Op",
+    "hivm-aggregated-decompose-op": "HIVM Aggregated Decompose Op",
+    "hivm-graph-sync-solver": "HIVM Graph Sync Solver",
+    "hivm-cross-core-gss": "HIVM Cross Core Graph Sync Solver",
+    "hivm-split-mix-kernel": "HIVM Split Mix Kernel",
+    "hivm-inject-sync": "HIVM Inject Sync",
+    "hivm-opt-single-point": "HIVM Optimize Single Point",
+    "hivm-sync-block-hoisting": "HIVM Sync Block Hoisting",
+    "hivm-bind-sync-block-lock-arg": "HIVM Bind Sync Block Lock Arg",
+    "hivm-lower-create-sync-block-lock": "HIVM Lower Create Sync Block Lock",
+    "convert-hivm-to-std": "Convert HIVM to Standard",
+    "convert-hivm-to-llvm": "Convert HIVM to LLVM",
+    "hivm-lower-to-loops": "HIVM Lower to Loops",
+    "hivm-map-forall-to-blocks": "HIVM Map Forall to Blocks",
+    "hivm-infer-data-layout": "HIVM Infer Data Layout",
+    "hivm-infer-mem-scope": "HIVM Infer Mem Scope",
+    "hivm-set-buffer-size": "HIVM Set Buffer Size",
+    "hivm-auto-infer-buffer-size": "HIVM Auto Infer Buffer Size",
+    "hivm-constantize-buffer-size": "HIVM Constantize Buffer Size",
+    "hivm-enable-multi-buffer": "HIVM Enable Multi Buffer",
+    "hivm-mark-multi-buffer": "HIVM Mark Multi Buffer",
+    "hivm-lower-multi-buffer-counter": "HIVM Lower Multi Buffer Counter",
+    "one-shot-bufferize": "One Shot Bufferize",
+    "hivm-flatten-ops": "HIVM Flatten Ops",
+    "hivm-mark-stride-align": "HIVM Mark Stride Align",
+    "hivm-enable-stride-align": "HIVM Enable Stride Align",
+    "hivm-alloc-extra-buffer": "HIVM Alloc Extra Buffer",
+    "hivm-memref-alloc-to-alloca": "HIVM Memref Alloc to Alloca",
+    "hivm-inline-otf-load-store": "HIVM Inline OTF Load Store",
+    "hivm-normalize-to-tensor": "HIVM Normalize to Tensor",
+    "hivm-tensor-copy-insertion": "HIVM Tensor Copy Insertion",
+    "hivm-remove-layout-annotation": "HIVM Remove Layout Annotation",
+    "hivm-insert-init-and-finish-for-debug": "HIVM Insert Init/Finish for Debug",
+}
+
+_CAMEL_CASE_TOKEN_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+")
+
+
+def humanize_bishengir_pass(pass_arg: str, mlir_name: str | None = None) -> str:
+    """Return a human-readable label for a bishengir NPUIR pass.
+
+    Prefers the curated :data:`BISHENGIR_PASS_LABELS` entry, then a CamelCase
+    split of the MLIR pass name (e.g. ``ConvertLinalgToHFusion`` ->
+    ``Convert Linalg To HFusion``), then a title-cased form of the pass argument.
+    """
+    label = BISHENGIR_PASS_LABELS.get(pass_arg)
+    if label:
+        return label
+    if mlir_name:
+        tokens = _CAMEL_CASE_TOKEN_RE.findall(mlir_name)
+        if tokens:
+            return " ".join(tokens)
+    return pass_arg.replace("-", " ").replace("_", " ").title()
+
+
+def sanitize_npuir_pass_name(pass_arg: str) -> str:
+    """Map a bishengir pass argument to a filename/stage-safe identifier."""
+    return re.sub(r"[^0-9a-zA-Z]+", "_", pass_arg).strip("_").lower()
+
+
+def make_npuir_pass_stage_descriptor(
+    stage_name: str,
+    display_label: str,
+    display_order: int,
+) -> IRStageDescriptor:
+    """Build the :class:`IRStageDescriptor` for one NPUIR pass artifact."""
+    return IRStageDescriptor(
+        name=stage_name,
+        extension=f".{stage_name}",
+        display_name=f"NPUIR Pass: {display_label}",
+        display_order=display_order,
+        is_text=True,
+        supports_source_mapping=True,
+        parser_id="generic_loc",
+        syntax_id="mlir",
+        is_pass_level=True,
+    )
 
 
 @dataclass
@@ -624,11 +756,15 @@ class AscendTritonAdapter(CompilationPipelineAdapter):
             IRStageDescriptor(
                 "bcmlir", ".bcmlir", "BCMLIR", 40, True, True, "generic_loc", "mlir"
             ),
+            # NPUIR pass stages are dynamically inserted at 401+ (see
+            # NPUIR_PASS_DISPLAY_ORDER_BASE), so NPUBIN/JSON are ordered far
+            # enough out to stay last regardless of how many passes a given
+            # bishengir version emits.
             IRStageDescriptor(
-                "npubin", ".npubin", "NPUBIN", 50, False, False, "none", "plaintext"
+                "npubin", ".npubin", "NPUBIN", 10000, False, False, "none", "plaintext"
             ),
             IRStageDescriptor(
-                "json", ".json", "JSON", 100, True, False, "none", "json"
+                "json", ".json", "JSON", 20000, True, False, "none", "json"
             ),
         ]
 
