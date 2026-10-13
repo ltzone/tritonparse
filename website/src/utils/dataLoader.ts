@@ -12,6 +12,13 @@ export interface IRStageDescriptor {
     is_text: boolean;
     supports_source_mapping: boolean;
     syntax_id: string;
+    /**
+     * True for compiler-pass-level stages that exist per trace rather than as a
+     * fixed pipeline step (e.g. Ascend NPUIR passes). They are shown alongside
+     * the main stages but excluded from the grouping-anchor calculation.
+     * Optional so traces written before the field existed still type-check.
+     */
+    is_pass_level?: boolean;
 }
 
 /**
@@ -900,11 +907,19 @@ export function getDefaultPanels(stages?: IRStageDescriptor[]): { left: string; 
  * NVIDIA: [ttir, ttgir, llir, ptx, sass] → llir
  * AMD:    [ttir, ttgir, llir, amdgcn]    → llir
  * Fallback: "ttgir" for old traces without ir_stages.
+ *
+ * Pass-level stages (Ascend NPUIR passes, one stage per compiler pass and
+ * therefore the overwhelming majority of stages) are excluded: they are not a
+ * meaningful "middle of the pipeline" anchor, and counting them would push the
+ * anchor out of the main stages entirely. If every viewable stage is
+ * pass-level, the full list is used so the result is never undefined.
  */
 export function getGroupingAnchor(stages?: IRStageDescriptor[]): string {
     const viewable = getViewableStages(stages);
     if (viewable.length > 0) {
-        return viewable[Math.floor(viewable.length / 2)].name;
+        const mainStages = viewable.filter(s => !s.is_pass_level);
+        const candidates = mainStages.length > 0 ? mainStages : viewable;
+        return candidates[Math.floor(candidates.length / 2)].name;
     }
     return "ttgir";
 }

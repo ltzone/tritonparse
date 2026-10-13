@@ -20,6 +20,10 @@ import {
   intersectRangeWithDoc,
   lineCountOfContent,
 } from "../../../src/components/monaco/comparisonMapping.ts";
+import {
+  getDefaultPanels,
+  getGroupingAnchor,
+} from "../../../src/utils/dataLoader.ts";
 import { normalizeHighlightLines } from "../../../src/components/monaco/highlightMath.ts";
 
 const STAGES: IRStageDescriptor[] = [
@@ -272,4 +276,57 @@ test("line count matches Monaco model line semantics", () => {
   assert.equal(lineCountOfContent("a\n"), 2);
   assert.equal(lineCountOfContent("a\nb\nc"), 3);
   assert.equal(lineCountOfContent("a\r\nb\r\n"), 3);
+});
+
+/**
+ * Ascend traces carry one stage per bishengir NPUIR pass, so pass-level stages
+ * outnumber the fixed pipeline stages by two orders of magnitude. They must not
+ * displace the grouping anchor (or the default panels) out of the main stages.
+ */
+const ASCEND_STAGES: IRStageDescriptor[] = [
+  { name: "ttir", extension: ".ttir", display_name: "TTIR", display_order: 10, is_text: true, supports_source_mapping: true, syntax_id: "mlir" },
+  { name: "ttadapter", extension: ".ttadapter", display_name: "TTAdapter", display_order: 20, is_text: true, supports_source_mapping: true, syntax_id: "mlir" },
+  { name: "bcmlir", extension: ".bcmlir", display_name: "BCMLIR", display_order: 40, is_text: true, supports_source_mapping: true, syntax_id: "mlir" },
+  ...Array.from({ length: 400 }, (_, i) => ({
+    name: `npuir_pass_p${i}`,
+    extension: `.npuir_pass_p${i}`,
+    display_name: `NPUIR Pass: P${i}`,
+    display_order: 401 + i,
+    is_text: true,
+    supports_source_mapping: true,
+    syntax_id: "mlir",
+    is_pass_level: true,
+  })),
+  { name: "npubin", extension: ".npubin", display_name: "NPUBIN", display_order: 10000, is_text: false, supports_source_mapping: false, syntax_id: "plaintext" },
+];
+
+test("pass-level stages are excluded from the grouping anchor", () => {
+  // Without the exclusion the median of 403 viewable stages lands inside the
+  // NPUIR pass range; the anchor must stay a main pipeline stage instead.
+  assert.equal(getGroupingAnchor(ASCEND_STAGES), "ttadapter");
+});
+
+test("grouping anchor falls back to all viewable stages when every stage is pass-level", () => {
+  const allPassLevel = ASCEND_STAGES.filter(s => s.is_pass_level);
+  assert.equal(getGroupingAnchor(allPassLevel), "npuir_pass_p200");
+});
+
+test("grouping anchor ignores non-viewable pass-level stages", () => {
+  const stages: IRStageDescriptor[] = [
+    ...ASCEND_STAGES.filter(s => !s.is_pass_level),
+    { ...ASCEND_STAGES[3], is_text: false },
+  ];
+  assert.equal(getGroupingAnchor(stages), "ttadapter");
+});
+
+test("grouping anchor keeps legacy behaviour without ir_stages", () => {
+  assert.equal(getGroupingAnchor(undefined), "ttgir");
+  assert.equal(getGroupingAnchor([]), "ttgir");
+});
+
+test("default panels stay on the first two main stages for Ascend", () => {
+  assert.deepEqual(getDefaultPanels(ASCEND_STAGES), {
+    left: "ttir",
+    right: "ttadapter",
+  });
 });
