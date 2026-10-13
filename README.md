@@ -13,7 +13,8 @@
 - **🚀 Launch Difference Analysis** - Detect and visualize kernel launch parameter variations
 - **📊 IR Code View** - Side-by-side IR viewing with synchronized highlighting and line mapping
 - **🔄 File Diff View** - Compare kernels across different trace files side-by-side
-- **📝 Multi-format IR Support** - View TTGIR, TTIR, LLIR, PTX, and AMDGCN
+- **📝 Multi-format IR Support** - View TTGIR, TTIR, LLIR, PTX, AMDGCN, and Ascend TTAdapter/NPUBIN
+- **🧩 NPUIR Pass-Level IR** - On Ascend NPU, drill into bishengir's individual compiler passes (opt-in)
 - **🎯 Interactive Code Views** - Click-to-highlight corresponding lines across IR stages
 
 ### 🔧 Reproducer & Debugging Tools

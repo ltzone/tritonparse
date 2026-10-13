@@ -1,0 +1,188 @@
+From 95ffc3a78aa6e5d95a1af070168967ba7696104e Mon Sep 17 00:00:00 2001
+From: TritonParse <tritonparse@example.com>
+Date: Tue, 13 Oct 2026 09:58:12 +0800
+Subject: [PATCH] [Backend](feat) capture bishengir NPUIR pass-level IR for
+ TritonParse
+
+Adds an opt-in hook that makes bishengir-compile dump the IR after every
+NPUIR pass, and persists the dump where TritonParse can pick it up.
+
+Enabled with TRITONPARSE_ENABLE_NPUIR_PASS_DUMP=1. Uses the standard MLIR
+flag --mlir-print-ir-after-all (not the whitelist-restricted
+--bishengir-print-ir-after=). --mlir-print-ir-after-failure is replaced
+rather than combined: MLIR gates every after-pass print on pass failure
+once that flag is present, which silences after-all printing entirely.
+
+TRITONPARSE_NPUIR_PASS_FILTER="pass-a,pass-b" restricts the dump to named
+passes. The combined stdout+stderr is written to npuir_passes.log in
+Triton's dump directory and its path recorded in the compilation metadata
+under "npuir_passes_log_path".
+
+Covers both the A2/A3 and 910_95 compile paths, including the failure path.
+---
+ third_party/ascend/backend/compiler.py | 111 ++++++++++++++++++++++++-
+ 1 file changed, 107 insertions(+), 4 deletions(-)
+
+diff --git a/third_party/ascend/backend/compiler.py b/third_party/ascend/backend/compiler.py
+index 2586f5cd3..db56723d0 100644
+--- a/third_party/ascend/backend/compiler.py
++++ b/third_party/ascend/backend/compiler.py
+@@ -403,6 +403,81 @@ def _save_npuir_debug_output(stdout_bytes: bytes, stderr_bytes: bytes, tmpdir: s
+         binary=False
+     )
+ 
++def _npuir_pass_dump_enabled() -> bool:
++    """Whether TritonParse should capture bishengir NPUIR pass-level IR.
++
++    Opt-in because the dump is large (roughly 1.5 MB of text per kernel, one
++    MLIR module per pass) and adds 10-20% to bishengir-compile time.
++    """
++    return os.getenv("TRITONPARSE_ENABLE_NPUIR_PASS_DUMP", "").strip().lower() in (
++        "1",
++        "true",
++        "yes",
++        "on",
++    )
++
++def _append_npuir_pass_dump_options(_compile_option_list):
++    """Append the IR-dump flags that expose bishengir's internal passes.
++
++    Uses the *standard* MLIR flag ``--mlir-print-ir-after-all`` rather than
++    bishengir's own ``--bishengir-print-ir-after=`` which is restricted to a
++    small whitelist of passes. ``--mlir-print-ir-after-change`` is deliberately
++    NOT used: several sync passes (e.g. hivm-inject-sync) are observable
++    precisely when they change the IR, and bishengir also mutates the module
++    in place for some passes, so "after-all" is the only lossless choice.
++
++    When ``TRITONPARSE_NPUIR_PASS_FILTER`` is set, only the named passes are
++    dumped (comma separated pass arguments, e.g.
++    ``hivm-graph-sync-solver,hivm-inject-sync``), which keeps the trace small.
++
++    Callers must not also pass ``--mlir-print-ir-after-failure``: MLIR gates
++    every after-pass print on pass failure once that flag is present, which
++    silences both forms added here.
++    """
++    pass_filter = os.getenv("TRITONPARSE_NPUIR_PASS_FILTER", "")
++    pass_names = [name.strip() for name in pass_filter.split(",") if name.strip()]
++    if pass_names:
++        for pass_name in pass_names:
++            _compile_option_list += [f"--mlir-print-ir-after={pass_name}"]
++    else:
++        # No filter, or a filter with no usable names (e.g. ","): dump everything
++        # rather than silently capturing nothing.
++        _compile_option_list += ["--mlir-print-ir-after-all"]
++    return _compile_option_list
++
++def _save_npuir_pass_dump(stdout_bytes: bytes, stderr_bytes: bytes, tmpdir: str, metadata: dict):
++    """Persist the bishengir per-pass IR dump and record its location.
++
++    ``--mlir-print-ir-after-all`` writes to stderr; stdout is appended as well
++    so diagnostics that bishengir prints there (UB size, warnings) are kept in
++    one place. The file is written to triton's dump directory for this kernel
++    hash and its absolute path is recorded in ``metadata`` so TritonParse can
++    embed the dump into the compilation trace even on a cache hit.
++    """
++    stdout = stdout_bytes.decode('utf-8', errors='replace') if stdout_bytes else ''
++    stderr = stderr_bytes.decode('utf-8', errors='replace') if stderr_bytes else ''
++    combined = stdout + stderr
++    if not combined.strip():
++        return
++
++    output_path = os.path.join(tmpdir, "npuir_passes.log")
++    with open(output_path, 'w', encoding='utf-8') as f:
++        f.write(combined)
++
++    try:
++        dump_manager = get_dump_manager(metadata["hash"])
++        dump_path = dump_manager.put(combined, "npuir_passes.log", binary=False)
++    except Exception as e:
++        # The dump directory is where the trace listener looks for the dump, and
++        # ``tmpdir`` is deleted as soon as this function returns, so there is
++        # nothing useful to record. Leave the metadata key unset: the feature
++        # degrades to "no NPUIR passes captured" instead of pointing TritonParse
++        # at a path that cannot exist.
++        print(f"[WARNING] Could not persist the NPUIR pass dump: {e}")
++        return
++
++    metadata["npuir_passes_log_path"] = dump_path
++
+ 
+ def try_compile_with_config(linalg: str, ub_config: Dict[str, Any], metadata: dict, opt) -> Tuple[bool, str]:
+     """
+@@ -632,9 +707,19 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
+         if mix_mode in ["aic"]:
+             _compile_option_list += ["--disable-hfusion-vectorize=true"]
+ 
+-        _compile_option_list += ["--mlir-print-ir-after-failure"]
++        # MLIR gates every after-pass print on "did the pass fail?" once
++        # --mlir-print-ir-after-failure is present, and that gate also disables
++        # --mlir-print-ir-after-all and --mlir-print-ir-after=<pass> (verified:
++        # both emit zero dumps when combined with it). The NPUIR pass dump
++        # therefore replaces the flag instead of joining it. Nothing is lost for
++        # failure diagnostics: --mlir-print-ir-after-all prints after every pass,
++        # including the one that failed.
++        if _npuir_pass_dump_enabled():
++            _append_npuir_pass_dump_options(_compile_option_list)
++        else:
++            _compile_option_list += ["--mlir-print-ir-after-failure"]
+         _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
+-        if opt.debug:
++        if not _npuir_pass_dump_enabled() and opt.debug:
+             _compile_option_list += ["--bishengir-print-ir-after=hivm-graph-sync-solver"]
+ 
+         cmd_list = (
+@@ -666,10 +751,14 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
+                 check=True
+             )
+         except subprocess.CalledProcessError as e:
++            if _npuir_pass_dump_enabled():
++                _save_npuir_pass_dump(e.stdout, e.stderr, tmpdir, metadata)
+             if opt.debug:
+                 _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata["hash"])
+             raise
+ 
++        if _npuir_pass_dump_enabled():
++            _save_npuir_pass_dump(ret.stdout, ret.stderr, tmpdir, metadata)
+         if opt.debug:
+             _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])
+ 
+@@ -868,9 +957,19 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
+                 "--enable-triton-kernel-compile=true",
+             ]
+ 
+-        _compile_option_list += ["--mlir-print-ir-after-failure"]
++        # MLIR gates every after-pass print on "did the pass fail?" once
++        # --mlir-print-ir-after-failure is present, and that gate also disables
++        # --mlir-print-ir-after-all and --mlir-print-ir-after=<pass> (verified:
++        # both emit zero dumps when combined with it). The NPUIR pass dump
++        # therefore replaces the flag instead of joining it. Nothing is lost for
++        # failure diagnostics: --mlir-print-ir-after-all prints after every pass,
++        # including the one that failed.
++        if _npuir_pass_dump_enabled():
++            _append_npuir_pass_dump_options(_compile_option_list)
++        else:
++            _compile_option_list += ["--mlir-print-ir-after-failure"]
+         _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
+-        if opt.debug:
++        if not _npuir_pass_dump_enabled() and opt.debug:
+             _compile_option_list += ["--bishengir-print-ir-after=hivm-graph-sync-solver"]
+         cmd_list = (
+             [npu_compiler_path, ttadapter_path]
+@@ -889,10 +988,14 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
+                 check=True
+             )
+         except subprocess.CalledProcessError as e:
++            if _npuir_pass_dump_enabled():
++                _save_npuir_pass_dump(e.stdout, e.stderr, tmpdir, metadata)
+             if opt.debug:
+                 _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata["hash"])
+             raise
+ 
++        if _npuir_pass_dump_enabled():
++            _save_npuir_pass_dump(ret.stdout, ret.stderr, tmpdir, metadata)
+         if opt.debug:
+             _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])
+ 
+-- 
+2.55.0
+

@@ -11,3 +11,4 @@
 - [Python API Reference](08.-Python-API-Reference)
 - [Reproducer Guide](09.-Reproducer-Guide)
 - [Adding a New Backend](10.-Adding-a-New-Backend)
+- [Ascend NPUIR Pass Capture](11.-Ascend-NPUIR-Pass-Capture)
