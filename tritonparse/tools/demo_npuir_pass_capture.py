@@ -172,8 +172,16 @@ def main():
         # Simulate the triton dump directory contents that the listener reads.
         hash_dir = os.path.join(dump_dir, metadata["hash"])
         os.makedirs(hash_dir, exist_ok=True)
+        # A realistic stub: a real kernel.ttir comes from `str(mod)` and does
+        # carry locations, so writing a loc-free placeholder here would make the
+        # demo's own trace look like the broken case.
         (Path(hash_dir) / "kernel.ttir").write_text(
-            "module {\n  tt.func public @kernel() {\n    tt.return\n  }\n}\n"
+            '#loc = loc("kernel.py":1:1)\n'
+            "module {\n"
+            "  tt.func public @kernel() loc(#loc) {\n"
+            "    tt.return loc(#loc)\n"
+            "  }\n"
+            "}\n"
         )
         (Path(hash_dir) / "kernel.ttadapter").write_text(ttadapter)
         (Path(hash_dir) / "kernel.npubin").write_bytes(b"\x00binary")

@@ -670,3 +670,97 @@ class TestExampleReporting(unittest.TestCase):
         example = self._load_example()
         with tempfile.TemporaryDirectory() as tmp, self.assertRaises(SystemExit):
             example.report_stages(tmp, None)
+
+
+class TestCheckNpuirTraceTool(unittest.TestCase):
+    """The trace diagnostic used to tell the failure modes apart.
+
+    All three ("no capture", "capture but no locations", "locations but no
+    mapping") present identically to a user as "no loc in the UI", so the tool
+    has to distinguish them from the trace alone.
+    """
+
+    @staticmethod
+    def _write_parsed(tmp: str, entry: dict, name: str = "t.ndjson") -> str:
+        from pathlib import Path
+
+        parsed = json.loads(parse_single_trace_content(json.dumps(entry)))
+        path = Path(tmp) / name
+        path.write_text(json.dumps(parsed) + "\n")
+        return str(path)
+
+    def test_reports_healthy_trace(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+
+        from tritonparse.tools.check_npuir_trace import _report
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_parsed(tmp, _build_entry())
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                status = _report(path)
+        out = buf.getvalue()
+        self.assertEqual(status, 0, out)
+        self.assertIn("locations captured and mapped", out)
+
+    def test_flags_a_loc_free_trace_and_names_the_cause(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+
+        from tritonparse.tools.check_npuir_trace import _report
+
+        entry = _build_entry()
+        entry["payload"]["file_content"]["kernel.npuir_passes.log"] = (
+            "// -----// IR Dump After CSE (cse) //----- //\nmodule {\n}\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_parsed(tmp, entry)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                status = _report(path)
+        out = buf.getvalue()
+        self.assertEqual(status, 1, out)
+        self.assertIn("no locations in the IR", out)
+        self.assertIn("--mlir-print-debuginfo", out)
+
+    def test_flags_a_trace_without_any_capture(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+
+        from tritonparse.tools.check_npuir_trace import _report
+
+        entry = _build_entry()
+        entry["payload"]["file_content"].pop(RAW_LOG_FILENAME)
+        entry["payload"]["file_path"] = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_parsed(tmp, entry)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                status = _report(path)
+        out = buf.getvalue()
+        self.assertEqual(status, 1, out)
+        self.assertIn("no compilation event with NPUIR pass artifacts", out)
+        self.assertIn("TRITONPARSE_ENABLE_NPUIR_PASS_DUMP", out)
+
+    def test_raw_log_is_recognised_as_unparsed(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        from pathlib import Path
+
+        from tritonparse.tools.check_npuir_trace import _report
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "raw.ndjson"
+            path.write_text(
+                json.dumps({"event_type": "compilation", "payload": {}}) + "\n"
+            )
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                status = _report(str(path))
+        self.assertEqual(status, 1)
+        self.assertIn("RAW log", buf.getvalue())

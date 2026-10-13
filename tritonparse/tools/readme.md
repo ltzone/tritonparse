@@ -66,3 +66,21 @@ Same feature, but with the NPU faked so it runs on any machine (it drives a real
 export PATH=/path/to/bishengir/bin:$PATH
 python -m tritonparse.tools.demo_npuir_pass_capture --out /tmp/npuir_demo
 ```
+
+### check_npuir_trace.py
+Diagnose why NPUIR pass stages show no source locations in the web UI. Several
+distinct failures all look the same from the UI ("no loc"), and they need
+different fixes; this tells them apart from the trace alone.
+
+**Usage:**
+```bash
+python -m tritonparse.tools.check_npuir_trace ./parsed/*.ndjson.gz
+python -m tritonparse.tools.check_npuir_trace ./logs        # parses first
+```
+
+It reports how many pass artifacts contain `loc(...)`, how many have a
+`source_mappings` entry, and a verdict:
+- *locations captured and mapped* — nothing to do
+- *no locations in the IR* — the dump was made without `--mlir-print-debuginfo`
+  (regenerate with a current TritonParse)
+- *locations present but not mapped* — a TritonParse parsing bug; report it
