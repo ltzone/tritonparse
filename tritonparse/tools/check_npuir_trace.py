@@ -149,6 +149,26 @@ def _report(path: str) -> int:
             )
         print(f"  source_mappings top keys  : {len(mappings)}  (expect ~{n + 3})")
 
+        # The upstream artifacts matter as much as the passes: bishengir can only
+        # print locations that its input still has. ttir usually keeps them, so
+        # ttir-without-ttadapter is the signature of a lowering bug that no
+        # bishengir flag can work around.
+        upstream = {
+            name: content
+            for name, content in file_content.items()
+            if isinstance(content, str)
+            and not _PASS_FILE_RE.search(name)
+            and name.rsplit(".", 1)[-1] in ("ttir", "ttadapter", "bcmlir", "mlirbc")
+        }
+        if upstream:
+            print("  upstream IR (bishengir's input is ttadapter/bcmlir):")
+            for name, content in sorted(upstream.items()):
+                mark = GREEN if _LOC_RE.search(content) else RED
+                print(
+                    f"    {name:<28} loc(...) = {len(_LOC_RE.findall(content))}"
+                    f"{mark}{RESET}"
+                )
+
         # A sample, so the file/line can be eyeballed.
         sample = next(iter(pass_files))
         entry = mappings.get(stage_name(sample)) or {}
@@ -161,23 +181,67 @@ def _report(path: str) -> int:
             )
 
         if len(with_loc) < n * 0.9:
-            print(
-                f"\n  {RED}VERDICT: no locations in the IR.{RESET}\n"
-                "  The dump was produced without --mlir-print-debuginfo, so no\n"
-                "  pass can map to a source line. TritonParse adds that flag\n"
-                "  itself; a trace with this shape was made by an older install\n"
-                "  or a patched triton-ascend that supplies its own flags.\n"
-                "  Fix: upgrade TritonParse and regenerate the trace.\n"
-                '    python -c "from tritonparse.ascend_npuir import _rewrite_cmd;'
-                " print(_rewrite_cmd(['/x/bishengir-compile','-o','o']))\""
+            ttir = next((c for k, c in upstream.items() if k.endswith(".ttir")), "")
+            lowered = next(
+                (
+                    c
+                    for k, c in upstream.items()
+                    if k.endswith((".ttadapter", ".bcmlir"))
+                ),
+                "",
             )
+            print(f"\n  {RED}VERDICT: no locations in the IR.{RESET}")
+            if _LOC_RE.search(ttir) and not _LOC_RE.search(lowered):
+                # bishengir can only print locations its input still carries, so
+                # this is not fixable from TritonParse.
+                print(
+                    "  ttir has locations but ttadapter/bcmlir do not. bishengir can\n"
+                    "  only print what its input still has, so no dump flag can\n"
+                    "  recover them -- the triton-ascend lowering for this kernel\n"
+                    "  dropped them. Upgrading TritonParse is still needed (it adds\n"
+                    "  --mlir-print-debuginfo) but will not help here; report the\n"
+                    "  lowering to triton-ascend. Meanwhile ttir IS mappable, so use\n"
+                    "  it for source-level correlation and the NPUIR passes for\n"
+                    "  structural diffing."
+                )
+            else:
+                print(
+                    "  The dump was produced without --mlir-print-debuginfo, so no\n"
+                    "  pass can map to a source line. TritonParse adds that flag\n"
+                    "  itself; a trace with this shape was made by an older install\n"
+                    "  or a patched triton-ascend that supplies its own flags.\n"
+                    "  Fix: upgrade TritonParse and regenerate the trace.\n"
+                    "    python -m tritonparse.tools.check_npuir_trace <trace>   # "
+                    "after reinstalling"
+                )
             worst = 1
         elif len(with_map) < n * 0.9:
-            print(
-                f"\n  {RED}VERDICT: locations are present but not mapped.{RESET}\n"
-                "  This is a TritonParse parsing bug, not a capture problem --\n"
-                "  please report it with this trace."
-            )
+            # Locations that never reach a .py file are the parser's own
+            # positions in the temporary kernel.mlir, i.e. the real source
+            # locations were stripped upstream of bishengir.
+            py_re = re.compile(r'"([^"]*\.py)"')
+            py_locs = sum(len(py_re.findall(c)) for c in pass_files.values())
+            if py_locs == 0:
+                print(
+                    f"\n  {RED}VERDICT: only parse positions, no source "
+                    f"locations.{RESET}\n"
+                    "  The dumps carry loc(...), but every one points at the\n"
+                    "  temporary input file (e.g. kernel.mlir), not at a .py\n"
+                    "  source. The triton-ascend lowering for this kernel\n"
+                    "  dropped the real locations before bishengir ran, so no\n"
+                    "  NPUIR pass can be mapped. Check whether the ttadapter\n"
+                    "  artifact in this trace has loc(...); if it does not while\n"
+                    "  ttir does, that is the regression to report upstream.\n"
+                    "  TritonParse deliberately drops these mappings rather than\n"
+                    "  pointing you at a deleted temp file."
+                )
+            else:
+                print(
+                    f"\n  {RED}VERDICT: locations are present but not mapped."
+                    f"{RESET}\n"
+                    "  This is a TritonParse parsing bug, not a capture problem --\n"
+                    "  please report it with this trace."
+                )
             worst = 1
         else:
             py = mappings.get("python", {})

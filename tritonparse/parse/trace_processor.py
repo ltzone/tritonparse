@@ -372,6 +372,23 @@ def _load_npuir_pass_log(payload: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _has_real_source_file(stage_map: Dict[str, Dict[str, Any]]) -> bool:
+    """Whether ``stage_map`` references at least one Python source file.
+
+    MLIR's parser records a source position for every op it reads, so a dump of a
+    module that had *no* real locations still prints ``loc(...)`` -- all of them
+    pointing at whatever file was fed to the compiler, e.g. the temporary
+    ``kernel.mlir`` that triton-ascend writes and deletes. Those are not source
+    locations and mapping them would point the user at a file that no longer
+    exists, which is worse than showing nothing.
+
+    Real locations for a Triton kernel always reach a ``.py`` file: the kernel's
+    own source, or a Triton library file for inlined code. A pass whose locations
+    never reach one carries only parse positions, so the caller drops it.
+    """
+    return any(str(info.get("file", "")).endswith(".py") for info in stage_map.values())
+
+
 def _get_npuir_pass_filter() -> Optional[Set[str]]:
     """Parse ``TRITONPARSE_NPUIR_PASS_FILTER`` into a set of pass arguments."""
     raw = os.getenv("TRITONPARSE_NPUIR_PASS_FILTER", "").strip()
@@ -784,6 +801,16 @@ def parse_single_trace_content(trace_content: str) -> str:
                 other_mappings if other_mappings else None,
                 metadata,
             )
+            if (
+                stage_map
+                and stage_name.startswith(NPUIR_PASS_STAGE_PREFIX)
+                and not _has_real_source_file(stage_map)
+            ):
+                logger.debug(
+                    f"Dropping parse-position-only locations for {stage_name}: "
+                    "the pass's IR carries no source locations"
+                )
+                stage_map = {}
             if stage_map:
                 stage_maps[stage_name] = stage_map
 

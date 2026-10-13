@@ -408,6 +408,45 @@ class TestParseSingleTraceContentNpuir(unittest.TestCase):
         # definition line -- a real location, not a diagnostic.
         self.assertIn("1", by_ir_line)
 
+    def test_parse_position_only_locations_are_dropped(self):
+        """Locations that never reach a .py file are parser positions.
+
+        MLIR's parser stamps every op it reads with a position in the file being
+        parsed, so a pass dump of a module whose real locations were stripped
+        upstream still contains loc(...) -- all pointing at the temporary
+        kernel.mlir triton-ascend wrote. Mapping those would send the user to a
+        file that no longer exists, so the stage must be dropped instead.
+        """
+        dump = "".join(
+            "// -----// IR Dump After Pass%d (pass-%d) //----- //\n"
+            "module {\n  func.func @k() {\n    return loc(#loc)\n  } loc(#loc)\n}\n"
+            'loc("/tmp/tmpabc/kernel.mlir":2:3)\n' % (i, i)
+            for i in range(3)
+        )
+        entry = _build_entry()
+        entry["payload"]["file_content"]["kernel.npuir_passes.log"] = dump
+        entry["payload"]["python_source"] = {
+            "file_path": SOURCE_FILE,
+            "code": "def kernel(): pass\n",
+            "start_line": 1,
+            "end_line": 2,
+        }
+        parsed = json.loads(parse_single_trace_content(json.dumps(entry)))
+        mappings = parsed["payload"]["source_mappings"]
+        npuir = [k for k in mappings if k.startswith(NPUIR_PASS_STAGE_PREFIX)]
+
+        self.assertEqual(npuir, [])
+        # The stages are still captured and selectable; only the useless
+        # mappings are dropped.
+        self.assertTrue(
+            [
+                s
+                for s in parsed["payload"]["ir_stages"]
+                if s["name"] == "npuir_pass_pass_0"
+            ]
+        )
+        self.assertIn("kernel.npuir_pass_pass_0", parsed["payload"]["file_content"])
+
     def test_python_mapping_reaches_the_kernel_source_lines(self):
         """Passes must surface the kernel's own lines, not just any file.
 
@@ -745,6 +784,41 @@ class TestCheckNpuirTraceTool(unittest.TestCase):
         self.assertEqual(status, 1, out)
         self.assertIn("no compilation event with NPUIR pass artifacts", out)
         self.assertIn("TRITONPARSE_ENABLE_NPUIR_PASS_DUMP", out)
+
+    def test_distinguishes_upstream_location_loss(self):
+        """ttir with loc + ttadapter without is a triton-ascend bug, not ours.
+
+        bishengir can only print locations its input still carries, so this
+        shape is unfixable from TritonParse; the verdict must say so rather than
+        blaming the dump flags.
+        """
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+
+        from tritonparse.tools.check_npuir_trace import _report
+
+        entry = _build_entry()
+        # ttir keeps its locations; the lowered artifacts lose them.
+        entry["payload"]["file_content"]["kernel.ttir"] = (
+            '#loc = loc("kernel.py":1:1)\nmodule {\n  func.func @k() loc(#loc) {\n'
+            "    return loc(#loc)\n  }\n}\n"
+        )
+        entry["payload"]["file_content"]["kernel.ttadapter"] = (
+            "module {\n  func.func @k() {\n    return\n  }\n}\n"
+        )
+        entry["payload"]["file_content"]["kernel.npuir_passes.log"] = (
+            "// -----// IR Dump After CSE (cse) //----- //\nmodule {\n}\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_parsed(tmp, entry)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                status = _report(path)
+        out = buf.getvalue()
+        self.assertEqual(status, 1, out)
+        self.assertIn("ttir has locations but ttadapter/bcmlir do not", out)
+        self.assertIn("triton-ascend lowering", out)
 
     def test_raw_log_is_recognised_as_unparsed(self):
         import io
