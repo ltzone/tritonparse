@@ -8,6 +8,7 @@ TTAdapter input are checked in as fixtures under ``tests/cpu/fixtures/npuir``.
 import gzip
 import json
 import os
+import re
 import unittest
 from pathlib import Path
 
@@ -104,6 +105,22 @@ class TestSplitBishengirDumpLog(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0][:2], ("Foo", "foo"))
         self.assertEqual(records[0][2], "module {}\n")
+
+    def test_fixture_carries_locations(self):
+        """The checked-in dump must have been captured with --mlir-print-debuginfo.
+
+        A loc-free fixture silently disables source mapping for every pass and
+        would let the mappability tests pass on stale data, so assert it here
+        rather than discovering it from a half-empty trace.
+        """
+        records = _split_bishengir_dump_log(_load_dump())
+        with_loc = [r for r in records if re.search(r"loc\([\"#]", r[2])]
+        self.assertGreater(
+            len(with_loc),
+            len(records) * 0.9,
+            f"only {len(with_loc)}/{len(records)} fixture dumps carry loc(...); "
+            "regenerate with --mlir-print-debuginfo",
+        )
 
     def test_real_fixture_dump(self):
         records = _split_bishengir_dump_log(_load_dump())
@@ -341,7 +358,17 @@ class TestParseSingleTraceContentNpuir(unittest.TestCase):
             # The stage name is the final dot-separated token.
             self.assertTrue(key.split(".")[-1].startswith(NPUIR_PASS_STAGE_PREFIX))
 
-    def test_source_mapping_generated_for_passes_that_carry_locs(self):
+    def test_most_passes_map_back_to_source_lines(self):
+        """Nearly every pass must be mappable, not just a lucky few.
+
+        This is the regression guard for the bug that made the feature look
+        half-working: MLIR does not print `loc(...)` unless
+        ``--mlir-print-debuginfo`` is passed, so without it every dump is
+        loc-free and no pass maps to a source line. The earlier version of this
+        test asserted only that *one* pass was mapped, and it passed for the
+        wrong reason -- the parser had matched the `loc("...")` inside
+        bishengir's *error messages*, not any real operation location.
+        """
         mappings = self.parsed["payload"]["source_mappings"]
         file_content = self.parsed["payload"]["file_content"]
 
@@ -350,19 +377,54 @@ class TestParseSingleTraceContentNpuir(unittest.TestCase):
             for k in file_content
             if k.startswith(f"kernel.{NPUIR_PASS_STAGE_PREFIX}")
         }
-        # Every generated mapping must belong to a real artifact; nothing is
-        # invented for passes whose IR carries no locations.
         mapped_stages = set(mappings) - {"python"}
-        self.assertTrue(mapped_stages)
+        # Every generated mapping belongs to a real artifact; nothing is
+        # invented for passes whose IR carries no locations.
         self.assertTrue(mapped_stages.issubset(npuir_artifacts | {"ttadapter"}))
 
-        # Most bishengir passes drop the original `loc(...)` annotations, but
-        # the debug-info pass preserves them, so at least that one is mapped.
-        debug_stage = mappings.get("npuir_pass_ensure_debug_info_scope_on_llvm_func")
-        self.assertIsNotNone(debug_stage)
-        entry = next(iter(debug_stage.values()))
-        self.assertIn(SOURCE_FILE, entry["file"])
-        self.assertIn("npuir_pass_ensure_debug_info_scope_on_llvm_func_line", entry)
+        npuir_mapped = mapped_stages & npuir_artifacts
+        self.assertGreater(
+            len(npuir_mapped),
+            len(npuir_artifacts) * 0.9,
+            f"only {len(npuir_mapped)}/{len(npuir_artifacts)} passes mapped; "
+            "is --mlir-print-debuginfo missing from the dump flags?",
+        )
+
+    def test_mapped_entries_point_at_real_operations(self):
+        """The mapping must come from IR locations, not from error text."""
+        mappings = self.parsed["payload"]["source_mappings"]
+
+        stage = "npuir_pass_canonicalize_module"
+        self.assertIn(stage, mappings)
+        by_ir_line = mappings[stage]
+        self.assertGreater(len(by_ir_line), 1)
+        for ir_line, entry in by_ir_line.items():
+            self.assertTrue(entry["file"].startswith(SOURCE_FILE), entry)
+            self.assertEqual(entry[f"{stage}_line"], int(ir_line))
+            # Real locations carry the source column; the error-message text that
+            # fooled the old test did not produce per-line entries at all.
+            self.assertIn("column", entry)
+        # The first dump is the input module, so its line 1 is the `#loc`
+        # definition line -- a real location, not a diagnostic.
+        self.assertIn("1", by_ir_line)
+
+    def test_python_mapping_reaches_the_kernel_source_lines(self):
+        """Passes must surface the kernel's own lines, not just any file.
+
+        This is what drives the Python-source highlight when a pass line is
+        clicked, so it needs the `{stage}_lines` property the frontend looks up
+        under ``getGroupingAnchor(ir_stages) + "_line"``.
+        """
+        py = self.parsed["payload"]["source_mappings"]["python"]
+        # The fixture kernel lives around lines 38-57 of the source file.
+        self.assertIn("38", py)
+        self.assertIn("npuir_pass_canonicalize_module_lines", py["38"])
+        # And the property the frontend actually reads must exist on the pass
+        # entries themselves.
+        mappings = self.parsed["payload"]["source_mappings"]
+        for ir_line, entry in mappings["npuir_pass_canonicalize_module"].items():
+            self.assertIn("npuir_pass_canonicalize_module_line", entry)
+            self.assertIn(str(entry["line"]), py)
 
     def test_ttadapter_source_mapping_still_present(self):
         mappings = self.parsed["payload"]["source_mappings"]
@@ -576,7 +638,9 @@ class TestExampleReporting(unittest.TestCase):
         text = buf.getvalue()
 
         self.assertIn("NPUIR passes    : ", text)
-        self.assertIn("source mappings :", text)
+        # The mapping rate, not a raw dump of the (400-entry) mapping keys: it is
+        # the signal that --mlir-print-debuginfo reached bishengir.
+        self.assertIn("mapped to source:", text)
         # It must surface the sync passes, which are the reason to use this.
         self.assertIn("hivm_graph_sync_solver", text)
         self.assertIn("first passes (in execution order)", text)

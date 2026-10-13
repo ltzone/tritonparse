@@ -231,11 +231,23 @@ def main():
                 npuir_stages = [
                     s for s in stages if s["name"].startswith("npuir_pass_")
                 ]
+                mapped_passes = [
+                    s
+                    for s in npuir_stages
+                    if payload.get("source_mappings", {}).get(s["name"])
+                ]
                 print(f"[demo] total stages       : {len(stages)}")
                 print(f"[demo] npuir pass stages  : {len(npuir_stages)}")
                 print(
-                    f"[demo] source_mappings    : {sorted(payload.get('source_mappings', {}))}"
+                    f"[demo] mapped to source   : {len(mapped_passes)}/"
+                    f"{len(npuir_stages)} passes"
                 )
+                if npuir_stages and len(mapped_passes) < len(npuir_stages) * 0.9:
+                    print(
+                        "         ^ low: the dumps carry few loc(...) annotations.\n"
+                        "           Check that --mlir-print-debuginfo was passed "
+                        "to bishengir."
+                    )
                 print("[demo] first 5 npuir stages:")
                 for s in npuir_stages[:5]:
                     print(

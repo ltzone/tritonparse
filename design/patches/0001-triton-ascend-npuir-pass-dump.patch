@@ -1,7 +1,7 @@
 From 95ffc3a78aa6e5d95a1af070168967ba7696104e Mon Sep 17 00:00:00 2001
 From: TritonParse <tritonparse@example.com>
 Date: Tue, 13 Oct 2026 09:58:12 +0800
-Subject: [PATCH] [Backend](feat) capture bishengir NPUIR pass-level IR for
+Subject: [PATCH 1/2] [Backend](feat) capture bishengir NPUIR pass-level IR for
  TritonParse
 
 Adds an opt-in hook that makes bishengir-compile dump the IR after every
@@ -183,6 +183,44 @@ index 2586f5cd3..db56723d0 100644
          if opt.debug:
              _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])
  
+-- 
+2.55.0
+
+
+From 4dd6464e83928c3d4d50e3c464afd84e8270d967 Mon Sep 17 00:00:00 2001
+From: TritonParse <tritonparse@example.com>
+Date: Tue, 13 Oct 2026 13:10:41 +0800
+Subject: [PATCH 2/2] [Backend](feat) print locations in NPUIR pass dumps
+
+--mlir-print-ir-after-all alone produces loc-free dumps: MLIR stores locations
+on every op but only prints them when OpPrintingFlags::printDebugInfo is set,
+and it defaults to off. Without locations no pass can be mapped back to a source
+line, which is most of the value of capturing the passes.
+
+Adds --mlir-print-debuginfo alongside the dump flags. Costs ~1.7x raw dump size
+(1.5 MB -> 2.6 MB for a real kernel), which gzip nearly eliminates since the
+added text is repetitive loc(...) strings.
+---
+ third_party/ascend/backend/compiler.py | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/third_party/ascend/backend/compiler.py b/third_party/ascend/backend/compiler.py
+index db56723d0..22954d64f 100644
+--- a/third_party/ascend/backend/compiler.py
++++ b/third_party/ascend/backend/compiler.py
+@@ -443,6 +443,12 @@ def _append_npuir_pass_dump_options(_compile_option_list):
+         # No filter, or a filter with no usable names (e.g. ","): dump everything
+         # rather than silently capturing nothing.
+         _compile_option_list += ["--mlir-print-ir-after-all"]
++    # MLIR stores locations on every op but does not *print* them unless this
++    # flag is set (OpPrintingFlags::printDebugInfo defaults to false). Without
++    # it the dumps carry no `loc(...)` at all, so no pass could be mapped back
++    # to a source line -- which is most of the point of capturing the passes.
++    # Costs ~1.7x dump size, which gzip takes back down.
++    _compile_option_list += ["--mlir-print-debuginfo"]
+     return _compile_option_list
+ 
+ def _save_npuir_pass_dump(stdout_bytes: bytes, stderr_bytes: bytes, tmpdir: str, metadata: dict):
 -- 
 2.55.0
 

@@ -269,7 +269,7 @@ class TestOptionalTaPatchHelpers(unittest.TestCase):
 
     def test_dump_all_flag(self):
         opts = ascend_compiler._append_npuir_pass_dump_options([])
-        self.assertEqual(opts, ["--mlir-print-ir-after-all"])
+        self.assertEqual(opts, ["--mlir-print-ir-after-all", "--mlir-print-debuginfo"])
 
     def test_dump_filter_flag(self):
         os.environ["TRITONPARSE_NPUIR_PASS_FILTER"] = " hivm-graph-sync-solver , cse "
@@ -279,6 +279,7 @@ class TestOptionalTaPatchHelpers(unittest.TestCase):
             [
                 "--mlir-print-ir-after=hivm-graph-sync-solver",
                 "--mlir-print-ir-after=cse",
+                "--mlir-print-debuginfo",
             ],
         )
         self.assertNotIn("--mlir-print-ir-after-all", opts)
@@ -304,7 +305,17 @@ class TestOptionalTaPatchHelpers(unittest.TestCase):
     def test_empty_filter_falls_back_to_dump_all(self):
         os.environ["TRITONPARSE_NPUIR_PASS_FILTER"] = "  ,  "
         opts = ascend_compiler._append_npuir_pass_dump_options([])
-        self.assertEqual(opts, ["--mlir-print-ir-after-all"])
+        self.assertEqual(opts, ["--mlir-print-ir-after-all", "--mlir-print-debuginfo"])
+
+    def test_debuginfo_flag_is_present(self):
+        """Without it no dump carries loc(...), so no pass maps to a line."""
+        for filter_value in (None, "cse"):
+            if filter_value is None:
+                os.environ.pop("TRITONPARSE_NPUIR_PASS_FILTER", None)
+            else:
+                os.environ["TRITONPARSE_NPUIR_PASS_FILTER"] = filter_value
+            opts = ascend_compiler._append_npuir_pass_dump_options([])
+            self.assertIn("--mlir-print-debuginfo", opts, filter_value)
 
 
 if __name__ == "__main__":

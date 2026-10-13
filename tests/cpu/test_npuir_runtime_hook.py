@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 from tritonparse.ascend_npuir import (
     _COMPILER_BASENAMES,
+    _DEBUGINFO_FLAG,
     _DUMP_ALL_FLAG,
     _FAILURE_FLAG,
     _is_bishengir_compile,
@@ -80,9 +81,41 @@ class TestRewriteCmd(_EnvSandbox):
         self.assertIn(_DUMP_ALL_FLAG, out)
         # Everything else is preserved, in order.
         self.assertEqual(
-            [a for a in out if a not in (_FAILURE_FLAG, _DUMP_ALL_FLAG)],
+            [
+                a
+                for a in out
+                if a not in (_FAILURE_FLAG, _DUMP_ALL_FLAG, _DEBUGINFO_FLAG)
+            ],
             [a for a in self.BASE if a != _FAILURE_FLAG],
         )
+
+    def test_debuginfo_flag_is_always_added(self):
+        """Without it MLIR prints no `loc(...)`, so no pass maps to a line.
+
+        MLIR stores locations on every op but only prints them when
+        OpPrintingFlags::printDebugInfo is set. Omitting this flag makes every
+        dump loc-free, which silently guts source mapping for all passes -- the
+        bug this test exists to prevent.
+        """
+        for env_filter in (None, "cse", "cse,other"):
+            if env_filter is None:
+                os.environ.pop("TRITONPARSE_NPUIR_PASS_FILTER", None)
+            else:
+                os.environ["TRITONPARSE_NPUIR_PASS_FILTER"] = env_filter
+            out = _rewrite_cmd(list(self.BASE))
+            self.assertIn(_DEBUGINFO_FLAG, out, env_filter)
+
+    def test_debuginfo_flag_is_not_duplicated(self):
+        cmd = list(self.BASE) + [_DEBUGINFO_FLAG]
+        out = _rewrite_cmd(cmd)
+        self.assertEqual(out.count(_DEBUGINFO_FLAG), 1)
+
+    def test_debuginfo_is_added_even_when_dump_flags_already_present(self):
+        """A patched triton-ascend adds the dump flag but not necessarily this."""
+        cmd = list(self.BASE) + [_DUMP_ALL_FLAG]
+        out = _rewrite_cmd(cmd)
+        self.assertEqual(out.count(_DUMP_ALL_FLAG), 1)
+        self.assertIn(_DEBUGINFO_FLAG, out)
 
     def test_dump_flag_is_inserted_before_output(self):
         out = _rewrite_cmd(list(self.BASE))
@@ -115,7 +148,8 @@ class TestRewriteCmd(_EnvSandbox):
 
     def test_appends_when_there_is_no_output_flag(self):
         out = _rewrite_cmd(["/bin/bishengir-compile", "in.mlir"])
-        self.assertEqual(out[-1], _DUMP_ALL_FLAG)
+        # No "-o", so the flags are appended after the input path.
+        self.assertEqual(out[-2:], [_DUMP_ALL_FLAG, _DEBUGINFO_FLAG])
 
 
 class _FakeSubprocess:

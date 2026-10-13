@@ -232,6 +232,22 @@ triton-ascend passes `--mlir-print-ir-after-failure` unconditionally, so the
 implementation drops it while the dump is enabled. Nothing is lost: after-all
 prints after every pass, including the failing one.
 
+### 1b. `--mlir-print-debuginfo` is required for source mapping
+
+MLIR stores a location on every operation but does not *print* it unless
+`OpPrintingFlags::printDebugInfo` is set, and it defaults to off. So
+`--mlir-print-ir-after-all` alone yields dumps that contain **zero** `loc(...)`
+annotations, and no pass can be mapped back to a source line.
+
+This was missed initially and produced a subtly green test: the only `loc(...)`
+in a loc-free dump comes from bishengir's own *error messages*, and the parser
+happily matched those. The fix is one flag; the fixture now carries ~6.8k
+locations and ~390 of ~400 passes map to source. It costs ~1.7x raw dump size
+(1.5 MB -> 2.6 MB) that gzip almost entirely removes.
+
+The lesson worth keeping: assert the *rate* of mapping, not that one example
+mapped, or a false positive passes as success.
+
 ### 2. Stage naming has no `.mlir` suffix
 
 Artifacts are `kernel.<stage_name>` with `stage_name = npuir_pass_<sanitized>`.

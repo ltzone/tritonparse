@@ -178,10 +178,19 @@ def report_stages(parsed_dir: str, filter_value: str | None) -> None:
                 passes = [s for s in stages if s["name"].startswith("npuir_pass_")]
                 mappings = payload.get("source_mappings", {})
 
+                mapped = [s for s in passes if mappings.get(s["name"])]
                 print(f"  trace           : {os.path.basename(path)}")
                 print(f"  total stages    : {len(stages)}")
                 print(f"  NPUIR passes    : {len(passes)}")
-                print(f"  source mappings : {sorted(mappings)}")
+                print(f"  mapped to source: {len(mapped)}/{len(passes)} passes")
+                if passes and len(mapped) < len(passes) * 0.9:
+                    print(
+                        "    ^ low: the dumps carry few loc(...) annotations, so "
+                        "most passes\n"
+                        "      cannot be tied back to a source line. Check that "
+                        "--mlir-print-debuginfo\n"
+                        "      reaches bishengir."
+                    )
 
                 if not passes:
                     print(

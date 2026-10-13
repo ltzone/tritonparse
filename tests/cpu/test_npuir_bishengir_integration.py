@@ -20,6 +20,7 @@ test is skipped when ``bishengir-compile`` is not on ``PATH``.
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -71,6 +72,9 @@ class TestBishengirDumpFlag(unittest.TestCase):
                 "--enable-hfusion-compile=true",
                 "--enable-triton-kernel-compile=true",
                 "--mlir-print-ir-after-all",
+                # Without this MLIR prints no loc(...) at all and no pass can be
+                # mapped to a source line; see the splitter's module docstring.
+                "--mlir-print-debuginfo",
                 "-o",
                 out,
             ]
@@ -108,6 +112,21 @@ class TestBishengirDumpFlag(unittest.TestCase):
         self.assertEqual(args[0], "canonicalize-module")
         for expected in EARLY_PASSES:
             self.assertIn(expected, args)
+
+    def test_debuginfo_flag_makes_locations_visible(self):
+        """The real toolchain must honour --mlir-print-debuginfo.
+
+        Locations are stored on ops but only printed when this flag is set. If a
+        bishengir build ignored it, the trace would still look fine while every
+        pass silently lost its source mapping.
+        """
+        with_loc = [r for r in self.records if re.search(r"loc\([\"#]", r[2])]
+        self.assertGreater(
+            len(with_loc),
+            len(self.records) * 0.9,
+            f"only {len(with_loc)}/{len(self.records)} dumps carry loc(...); "
+            "--mlir-print-debuginfo did not take effect",
+        )
 
     def test_every_record_has_a_usable_name_and_body(self):
         for mlir_name, pass_arg, ir in self.records:

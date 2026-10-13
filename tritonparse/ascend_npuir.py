@@ -42,6 +42,13 @@ from tritonparse.tp_logger import logger
 _DUMP_ALL_FLAG = "--mlir-print-ir-after-all"
 _FAILURE_FLAG = "--mlir-print-ir-after-failure"
 
+# MLIR stores locations on every op but does not *print* them unless this flag is
+# set (OpPrintingFlags::printDebugInfo defaults to false). Without it the dumps
+# carry no `loc(...)` at all, so no pass could be mapped back to a source line --
+# which is most of the point of capturing the passes. Costs ~1.7x dump size
+# (1.5 MB -> 2.6 MB for a real kernel), which gzip takes back down.
+_DEBUGINFO_FLAG = "--mlir-print-debuginfo"
+
 # triton-ascend resolves the compiler to either `bishengir-compile` (modern) or
 # `<root>/npuc` (legacy TRITON_NPU_COMPILER_PATH layout).
 _COMPILER_BASENAMES = ("bishengir-compile", "npuc")
@@ -63,13 +70,16 @@ def npuir_pass_dump_enabled() -> bool:
     return os.getenv(_ENV_ENABLE, "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _dump_flags() -> List[str]:
-    """The IR-dump flags to pass to bishengir, honouring the optional filter.
+def _after_flags() -> List[str]:
+    """The after-pass dump flags, honouring the optional pass filter.
 
     ``--mlir-print-ir-after-change`` is deliberately not used: several sync
     passes (e.g. hivm-inject-sync) are observable precisely when they change the
     IR, and bishengir also mutates the module in place for some passes, so
     "after-all" is the only lossless choice.
+
+    The debug-info flag is added separately by :func:`_flags_to_add`, so this
+    stays purely about *which* passes get dumped.
     """
     raw = os.getenv(_ENV_FILTER, "")
     names = [name.strip() for name in raw.split(",") if name.strip()]
@@ -78,6 +88,27 @@ def _dump_flags() -> List[str]:
     # No filter, or a filter with no usable names (e.g. ","): dump everything
     # rather than silently capturing nothing.
     return [_DUMP_ALL_FLAG]
+
+
+def _has_after_flags(cmd: List[str]) -> bool:
+    return any(
+        arg == _DUMP_ALL_FLAG or arg.startswith("--mlir-print-ir-after=") for arg in cmd
+    )
+
+
+def _flags_to_add(cmd: List[str]) -> List[str]:
+    """Which dump flags ``cmd`` is still missing.
+
+    Split out from the rewrite so each flag is added at most once: a patched
+    triton-ascend may already supply the after-pass flags, and a caller may
+    already have supplied the debug-info one.
+    """
+    to_add: List[str] = []
+    if not _has_after_flags(cmd):
+        to_add.extend(_after_flags())
+    if _DEBUGINFO_FLAG not in cmd:
+        to_add.append(_DEBUGINFO_FLAG)
+    return to_add
 
 
 def _is_bishengir_compile(cmd: Any) -> bool:
@@ -101,19 +132,15 @@ def _rewrite_cmd(cmd: List[str]) -> List[str]:
     the failing one.
     """
     rewritten = [arg for arg in cmd if arg != _FAILURE_FLAG]
-    dump_flags = _dump_flags()
-    already = any(
-        arg == _DUMP_ALL_FLAG or arg.startswith("--mlir-print-ir-after=")
-        for arg in rewritten
-    )
-    if not already:
+    to_add = _flags_to_add(rewritten)
+    if to_add:
         # Insert before "-o <file>" so the flags stay grouped with the other
         # compile options rather than trailing the output path.
         try:
             insert_at = rewritten.index("-o")
         except ValueError:
             insert_at = len(rewritten)
-        rewritten[insert_at:insert_at] = dump_flags
+        rewritten[insert_at:insert_at] = to_add
     return rewritten
 
 
