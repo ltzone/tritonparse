@@ -21,6 +21,12 @@ CODE_LOC_PATTERN = re.compile(r".*loc\(#loc(\d*)\)\s*$")
 # this pattern is used in the first function arguments line.
 DIRECT_FILE_PATTERN = re.compile(r'.*loc\("([^"]+)":(\d+):(\d+)\)')
 
+# Inline NameLoc, including nested names: loc("x"("file.py":12:3)).
+INLINE_NAMED_FILE_PATTERN = re.compile(
+    r'loc\((?P<names>(?:"[^"\n]*"\()+)"(?P<file>[^"\n]+)":'
+    r"(?P<line>\d+):(?P<column>\d+)\)+"
+)
+
 # LLVM IR debug metadata (LLIR).  Unlike MLIR's `#loc`, LLVM records source
 # locations as `!dbg !N` references into `!N = !DILocation(...)` nodes.
 # Example:
@@ -633,6 +639,10 @@ def extract_code_locations(ir_content: str) -> Dict[int, str]:
     for i, line in enumerate(ir_content.split("\n"), start=1):
         if m := CODE_LOC_PATTERN.search(line):
             line_to_loc[i] = m.group(1) or "0"
+        elif m := INLINE_NAMED_FILE_PATTERN.search(line):
+            line_to_loc[i] = (
+                f"direct:{m.group('file')}:{m.group('line')}:{m.group('column')}"
+            )
         elif m := DIRECT_FILE_PATTERN.search(line):
             file_path, ln, col = m.groups()
             line_to_loc[i] = f"direct:{file_path}:{ln}:{col}"
@@ -877,6 +887,7 @@ def _parse_generic_loc(
     logger.debug(f"Found {len(loc_refs)} loc references")
 
     mappings: Dict[str, Dict[str, Any]] = {}
+    ir_lines = ir_content.splitlines()
     for ln, loc_id in loc_refs.items():
         if loc_id.startswith("direct:"):
             _, file_path, line, col = loc_id.split(":", 3)
@@ -886,6 +897,11 @@ def _parse_generic_loc(
                 "column": int(col),
                 f"{ir_type}_line": ln,
             }
+            named = INLINE_NAMED_FILE_PATTERN.search(ir_lines[ln - 1])
+            if named:
+                mappings[str(ln)]["alias_name"] = re.findall(
+                    r'"([^"\n]*)"\(', named.group("names")
+                )[0]
         elif loc_id in loc_defs:
             info = loc_defs[loc_id]
             entry = {

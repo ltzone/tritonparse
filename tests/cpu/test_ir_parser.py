@@ -19,6 +19,31 @@ from tritonparse.parse.mapper import (
 from tritonparse.parse.trace_processor import generate_source_mappings
 
 
+class TestInlineNamedLocations(unittest.TestCase):
+    def test_named_locations_reach_python_mapping(self):
+        ir = "\n".join(
+            [
+                '%0 = memref.subview %arg0[0] [64] [1] loc("x"("/tmp/kernel.py":123:16))',
+                'vector.transfer_write %cst, %0[%c0] loc("y"("/tmp/kernel.py":124:16))',
+                'return loc("outer"("inner"("/tmp/kernel.py":125:4)))',
+                "%c0 = arith.constant 0 : index loc(unknown)",
+            ]
+        )
+        mapping = generate_source_mappings(ir, "npuir_pass_test")
+        self.assertEqual(set(mapping), {"1", "2", "3"})
+        for line, source_line, name in (
+            ("1", 123, "x"),
+            ("2", 124, "y"),
+            ("3", 125, "outer"),
+        ):
+            self.assertEqual(mapping[line]["file"], "/tmp/kernel.py")
+            self.assertEqual(mapping[line]["line"], source_line)
+            self.assertEqual(mapping[line]["alias_name"], name)
+        reverse = create_python_mapping([("npuir_pass_test", mapping)])
+        self.assertEqual(reverse[123]["npuir_pass_test_lines"], ["1"])
+        self.assertEqual(reverse[124]["npuir_pass_test_lines"], ["2"])
+
+
 class TestInlinedCallSiteMapping(unittest.TestCase):
     """Inlined code must map back to the line the user actually wrote.
 
