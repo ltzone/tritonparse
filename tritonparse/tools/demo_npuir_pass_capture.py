@@ -132,6 +132,9 @@ def main():
         shutil.rmtree(out_root)
     logs_dir = out_root / "logs"
     logs_dir.mkdir(parents=True)
+    # Sizes of the three artifacts, printed together at the end so it is
+    # unambiguous which one a given number refers to.
+    sizes: dict[str, int] = {}
 
     with tempfile.TemporaryDirectory() as workdir:
         dump_dir = os.path.join(workdir, "dump")
@@ -163,7 +166,8 @@ def main():
         dump_path = metadata.get("npuir_passes_log_path")
         print(f"[demo] dump recorded at: {dump_path}")
         assert dump_path and os.path.exists(dump_path), "no NPUIR dump was produced"
-        print(f"[demo] dump size: {os.path.getsize(dump_path)} bytes")
+        sizes["dump"] = os.path.getsize(dump_path)
+        print(f"[demo] dump size: {sizes['dump']} bytes")
 
         # Simulate the triton dump directory contents that the listener reads.
         hash_dir = os.path.join(dump_dir, metadata["hash"])
@@ -258,6 +262,28 @@ def main():
                 for s in sorted(stages, key=lambda s: s["display_order"])[-3:]:
                     print(f"         {s['display_order']:>5}  {s['name']}")
                 break
+
+    raw_traces = sorted(logs_dir.glob("*.ndjson*"))
+    if raw_traces:
+        sizes["raw_trace"] = sum(p.stat().st_size for p in raw_traces)
+    parsed_traces = [p for p in out_dir.rglob("*.ndjson*") if p.is_file()]
+    if parsed_traces:
+        sizes["parsed_trace"] = sum(p.stat().st_size for p in parsed_traces)
+
+    # Without --mlir-print-debuginfo the parsed trace is ~43 KB for this kernel
+    # and ~125 KB with it, so the size is a usable (if coarse) sanity check.
+    print("\n== sizes (the three artifacts people mix up) ==")
+    for label, key, note in (
+        ("bishengir dump   ", "dump", "npuir_passes.log, plain text"),
+        ("raw trace        ", "raw_trace", "logs/*.ndjson, uncompressed"),
+        (
+            "parsed trace     ",
+            "parsed_trace",
+            "parsed/*_mapped.ndjson.gz -- ~43 KB without loc, ~125 KB with",
+        ),
+    ):
+        if key in sizes:
+            print(f"  {label}: {sizes[key]:>10,} B   ({note})")
 
 
 if __name__ == "__main__":
